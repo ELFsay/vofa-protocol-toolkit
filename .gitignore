@@ -1,0 +1,24 @@
+# 运行时生成的文件（各人机器上的路径/窗口尺寸/DPI 选择，不提交）
+config-tool/tool.cfg
+config-tool/selftest.log
+config-tool/error.log
+
+# 历史版本备份（只保留当前源码与上一版即可，按需提交）
+config-tool/ProtocolTool-v1.src.txt
+config-tool/ProtocolTool-v2.src.txt
+config-tool/ProtocolTool-v3.src.txt
+config-tool/ProtocolTool-v4.src.txt
+config-tool/tool-v1-backup.exe
+
+# 编译中间产物
+*.obj
+*.pdb
+*.user
+*.suo
+build/
+dist/
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store

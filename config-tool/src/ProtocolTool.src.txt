@@ -1,0 +1,1587 @@
+// VOFA+ 自定义协议配置工具 v2 —— 界面仿 VOFA+ "接收解析格式"
+// 编译：csc /nologo /target:winexe /out:cmake.exe /win32icon:tool.ico /r:System.Windows.Forms.dll /r:System.Drawing.dll ProtocolTool2.src.txt
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Windows.Forms;
+
+namespace VofaProtocolTool
+{
+    // ================= 数据模型 =================
+    class Segment
+    {
+        public string Kind = "data";   // head/id/seq/len/data/resv/sum/tail
+        public string Tag = "";        // resv 的显示名：帧序号/帧ID/3Byte/定长数组/变长数组
+        public int Bytes = 1;
+        public string Hex = "";        // head / tail
+        public string Name = "";
+        public string PType = "uint8"; // data 的插件类型
+        public string Endian = "little";
+        public double Scale = 1.0;
+        public double Bias = 0.0;
+        public bool Export = true;     // 是否输出为通道（显示到面板）
+        public int LenSize = 2;        // 帧长度字段宽度
+        public int LenAdjust = 0;
+        public string ChkType = "sum8";
+        public int RangeFrom = 0;
+        public int RangeTo = -1;
+        public int ElemCount = 8;      // 定长数组元素个数
+    }
+
+    class TypeItem
+    {
+        public string Type;
+        public TypeItem(string t) { Type = t; }
+        public override string ToString() { return PTypes.Label(Type); }
+    }
+
+    static class PTypes
+    {
+        public static int Width(string t)
+        {
+            switch (t)
+            {
+                case "int8": case "uint8": return 1;
+                case "int16": case "uint16": return 2;
+                case "int32": case "uint32": case "float32": return 4;
+                case "int64": case "uint64": case "float64": return 8;
+            }
+            return 0;
+        }
+        public static string[] ForWidth(int w)
+        {
+            if (w == 1) return new string[] { "uint8", "int8" };
+            if (w == 2) return new string[] { "uint16", "int16" };
+            if (w == 4) return new string[] { "uint32", "int32", "float32" };
+            if (w == 8) return new string[] { "uint64", "int64", "float64" };
+            return new string[] { "uint8" };
+        }
+        public static string Label(string t)
+        {
+            switch (t)
+            {
+                case "uint8": return "无符号整数 (uint8)";
+                case "int8": return "有符号整数 (int8)";
+                case "uint16": return "无符号整数 (uint16)";
+                case "int16": return "有符号整数 (int16)";
+                case "uint32": return "无符号整数 (uint32)";
+                case "int32": return "有符号整数 (int32)";
+                case "float32": return "浮点数 (float32)";
+                case "uint64": return "无符号整数 (uint64)";
+                case "int64": return "有符号整数 (int64)";
+                case "float64": return "浮点数 (float64)";
+            }
+            return t;
+        }
+        public static string[] Checksums = new string[] { "none", "sum8", "xor8", "crc16_modbus" };
+        public static string ChkLabel(string t)
+        {
+            switch (t)
+            {
+                case "none": return "NONE（不校验）";
+                case "sum8": return "SUM8";
+                case "xor8": return "XOR8";
+                case "crc16_modbus": return "CRC16-MODBUS";
+            }
+            return t;
+        }
+        public static int ChkBytes(string t) { return t == "crc16_modbus" ? 2 : 1; }
+    }
+
+    static class HexUtil
+    {
+        public static bool IsHexChar(char c)
+        {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        }
+
+        // "aa55eb90" / "0xAA,0x55" -> "AA 55 EB 90"
+        public static string Normalize(string s)
+        {
+            if (s == null) return "";
+            string t = s.Replace("0x", "").Replace("0X", "");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < t.Length; i++)
+            {
+                char c = t[i];
+                if (IsHexChar(c)) sb.Append(char.ToUpperInvariant(c));
+                else if (c == ' ' || c == '\t' || c == ',' || c == ';' || c == '_' || c == '-' || c == '\r' || c == '\n') continue;
+                else throw new FormatException("非法十六进制字符：" + c);
+            }
+            if (sb.Length % 2 != 0) throw new FormatException("十六进制位数必须为偶数");
+            StringBuilder o = new StringBuilder();
+            for (int i = 0; i < sb.Length; i += 2)
+            {
+                if (i > 0) o.Append(' ');
+                o.Append(sb[i]); o.Append(sb[i + 1]);
+            }
+            return o.ToString();
+        }
+
+        public static int ByteCount(string normalized)
+        {
+            if (normalized == null || normalized.Length == 0) return 0;
+            return (normalized.Length + 1) / 3;
+        }
+    }
+
+    // ================= 帧布局 =================
+    class Frame
+    {
+        public string Name = "MyProtocol";
+        public List<Segment> Segs = new List<Segment>();
+
+        public int TotalBytes()
+        {
+            int n = 0;
+            foreach (Segment s in Segs) n += s.Bytes;
+            return n;
+        }
+
+        public int OffsetOf(int index)
+        {
+            int n = 0;
+            for (int i = 0; i < index && i < Segs.Count; i++) n += Segs[i].Bytes;
+            return n;
+        }
+
+        public bool HasVarArray()
+        {
+            foreach (Segment s in Segs) if (s.Kind == "resv" && s.Tag == "变长数组") return true;
+            return false;
+        }
+
+        public string KindName(Segment s)
+        {
+            switch (s.Kind)
+            {
+                case "head": return "帧头";
+                case "tail": return "帧尾";
+                case "seq": return "帧序号";
+                case "id": return "帧ID";
+                case "len": return "帧长度";
+                case "sum": return "校验";
+                case "resv": return s.Tag.Length > 0 ? s.Tag : "保留";
+                case "data": return s.Name.Length > 0 ? s.Name : "字段";
+            }
+            return s.Kind;
+        }
+
+        public string ZeroText(int bytes)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < bytes; i++)
+            {
+                if (i > 0) sb.Append(' ');
+                sb.Append("00");
+            }
+            return sb.ToString();
+        }
+    }
+
+    // ================= 极简 JSON =================
+    static class MiniJson
+    {
+        public static object Parse(string s)
+        {
+            int i = 0;
+            object v = ParseValue(s, ref i);
+            SkipWs(s, ref i);
+            if (i < s.Length) throw new FormatException("JSON 末尾存在多余内容（位置 " + i + "）");
+            return v;
+        }
+        static void SkipWs(string s, ref int i) { while (i < s.Length && char.IsWhiteSpace(s[i])) i++; }
+        static object ParseValue(string s, ref int i)
+        {
+            SkipWs(s, ref i);
+            if (i >= s.Length) throw new FormatException("JSON 意外结束");
+            char c = s[i];
+            if (c == '{') return ParseObject(s, ref i);
+            if (c == '[') return ParseArray(s, ref i);
+            if (c == '"') return ParseString(s, ref i);
+            if (c == 't') { Expect(s, ref i, "true"); return true; }
+            if (c == 'f') { Expect(s, ref i, "false"); return false; }
+            if (c == 'n') { Expect(s, ref i, "null"); return null; }
+            return ParseNumber(s, ref i);
+        }
+        static void Expect(string s, ref int i, string lit)
+        {
+            if (i + lit.Length > s.Length || s.Substring(i, lit.Length) != lit) throw new FormatException("非法字面量（位置 " + i + "）");
+            i += lit.Length;
+        }
+        static Dictionary<string, object> ParseObject(string s, ref int i)
+        {
+            Dictionary<string, object> d = new Dictionary<string, object>();
+            i++; SkipWs(s, ref i);
+            if (i < s.Length && s[i] == '}') { i++; return d; }
+            while (true)
+            {
+                SkipWs(s, ref i);
+                if (i >= s.Length || s[i] != '"') throw new FormatException("对象的键必须是字符串（位置 " + i + "）");
+                string k = ParseString(s, ref i);
+                SkipWs(s, ref i);
+                if (i >= s.Length || s[i] != ':') throw new FormatException("对象缺少冒号（位置 " + i + "）");
+                i++;
+                d[k] = ParseValue(s, ref i);
+                SkipWs(s, ref i);
+                if (i < s.Length && s[i] == ',') { i++; continue; }
+                if (i < s.Length && s[i] == '}') { i++; return d; }
+                throw new FormatException("对象缺少 , 或 }（位置 " + i + "）");
+            }
+        }
+        static object[] ParseArray(string s, ref int i)
+        {
+            List<object> a = new List<object>();
+            i++; SkipWs(s, ref i);
+            if (i < s.Length && s[i] == ']') { i++; return a.ToArray(); }
+            while (true)
+            {
+                a.Add(ParseValue(s, ref i));
+                SkipWs(s, ref i);
+                if (i < s.Length && s[i] == ',') { i++; continue; }
+                if (i < s.Length && s[i] == ']') { i++; return a.ToArray(); }
+                throw new FormatException("数组缺少 , 或 ]（位置 " + i + "）");
+            }
+        }
+        static string ParseString(string s, ref int i)
+        {
+            StringBuilder sb = new StringBuilder();
+            i++;
+            while (i < s.Length)
+            {
+                char c = s[i++];
+                if (c == '"') return sb.ToString();
+                if (c == '\\')
+                {
+                    if (i >= s.Length) break;
+                    char e = s[i++];
+                    switch (e)
+                    {
+                        case '"': sb.Append('"'); break;
+                        case '\\': sb.Append('\\'); break;
+                        case '/': sb.Append('/'); break;
+                        case 'b': sb.Append('\b'); break;
+                        case 'f': sb.Append('\f'); break;
+                        case 'n': sb.Append('\n'); break;
+                        case 'r': sb.Append('\r'); break;
+                        case 't': sb.Append('\t'); break;
+                        case 'u': if (i + 4 <= s.Length) { sb.Append((char)Convert.ToInt32(s.Substring(i, 4), 16)); i += 4; } break;
+                        default: sb.Append(e); break;
+                    }
+                }
+                else sb.Append(c);
+            }
+            throw new FormatException("字符串未闭合");
+        }
+        static object ParseNumber(string s, ref int i)
+        {
+            int st = i;
+            while (i < s.Length && (char.IsDigit(s[i]) || s[i] == '-' || s[i] == '+' || s[i] == '.' || s[i] == 'e' || s[i] == 'E')) i++;
+            string t = s.Substring(st, i - st);
+            double d;
+            if (!double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out d)) throw new FormatException("非法数字：" + t);
+            return d;
+        }
+    }
+
+    // ================= 与插件 configurable_engine.json 互转 =================
+    static class Cfg
+    {
+        public static Frame Default()
+        {
+            Frame f = new Frame();
+            f.Name = "ExampleSensor";
+            Segment h = new Segment(); h.Kind = "head"; h.Hex = "AA 55"; h.Bytes = 2; f.Segs.Add(h);
+            Segment d1 = new Segment(); d1.Kind = "data"; d1.Name = "temperature_c"; d1.PType = "int16"; d1.Bytes = 2; d1.Scale = 0.01; f.Segs.Add(d1);
+            Segment d2 = new Segment(); d2.Kind = "data"; d2.Name = "pressure_pa"; d2.PType = "uint32"; d2.Bytes = 4; f.Segs.Add(d2);
+            Segment d3 = new Segment(); d3.Kind = "data"; d3.Name = "voltage_v"; d3.PType = "float32"; d3.Bytes = 4; f.Segs.Add(d3);
+            Segment t = new Segment(); t.Kind = "tail"; t.Hex = "0D 0A"; t.Bytes = 2; f.Segs.Add(t);
+            return f;
+        }
+
+        public static string ToJson(Frame f, List<string> warnings)
+        {
+            int total = f.TotalBytes();
+            bool fixedOk = !f.HasVarArray();
+            Segment head = null, tail = null, len = null, sum = null;
+            foreach (Segment s in f.Segs)
+            {
+                if (s.Kind == "head") head = s;
+                else if (s.Kind == "tail") tail = s;
+                else if (s.Kind == "len") len = s;
+                else if (s.Kind == "sum") sum = s;
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.Append("{\n");
+            sb.Append("  \"name\": ").Append(Q(f.Name)).Append(",\n");
+            sb.Append("  \"framing\": {\n");
+            sb.Append("    \"header\": ").Append(Q(head == null ? "" : Trim(HexUtil.Normalize(head.Hex)))).Append(",\n");
+            if (tail != null && tail.Bytes > 0) sb.Append("    \"tail\": ").Append(Q(Trim(HexUtil.Normalize(tail.Hex)))).Append(",\n");
+            sb.Append("    \"fixed_length\": ").Append(fixedOk ? total : 0).Append(",\n");
+            sb.Append("    \"minimum_length\": ").Append(1).Append(",\n");
+            sb.Append("    \"maximum_length\": ").Append(fixedOk ? Math.Max(total, 1) : 65536);
+            if (len != null)
+            {
+                sb.Append(",\n    \"length_field\": {\n");
+                sb.Append("      \"offset\": ").Append(f.OffsetOf(f.Segs.IndexOf(len))).Append(",\n");
+                sb.Append("      \"size\": ").Append(len.LenSize).Append(",\n");
+                sb.Append("      \"endian\": ").Append(Q(len.Endian)).Append(",\n");
+                sb.Append("      \"adjust\": ").Append(len.LenAdjust).Append("\n    }");
+            }
+            sb.Append("\n  },\n");
+            sb.Append("  \"fields\": [\n");
+            List<string> lines = new List<string>();
+            for (int i = 0; i < f.Segs.Count; i++)
+            {
+                Segment s = f.Segs[i];
+                if (s.Kind != "data" || !s.Export) continue;
+                int w = PTypes.Width(s.PType);
+                lines.Add("    {\n      \"name\": " + Q(s.Name) + ",\n      \"offset\": " + f.OffsetOf(i) + ",\n      \"type\": " + Q(s.PType)
+                    + ",\n      \"endian\": " + Q(s.Endian) + ",\n      \"scale\": " + Num(s.Scale) + ",\n      \"bias\": " + Num(s.Bias) + "\n    }");
+            }
+            for (int i = 0; i < lines.Count; i++) sb.Append(lines[i]).Append(i == lines.Count - 1 ? "\n" : ",\n");
+            sb.Append("  ],\n");
+            string ct = (sum == null || !sum.Export) ? "none" : sum.ChkType;
+            sb.Append("  \"checksum\": { \"type\": ").Append(Q(ct));
+            if (ct != "none" && sum != null)
+            {
+                int off = f.OffsetOf(f.Segs.IndexOf(sum));
+                int rf = sum.RangeFrom;
+                int rt = sum.RangeTo < 0 ? off : sum.RangeTo;
+                sb.Append(", \"offset\": ").Append(off)
+                  .Append(", \"range_start\": ").Append(rf)
+                  .Append(", \"range_end\": ").Append(rt)
+                  .Append(", \"endian\": ").Append(Q(sum.Endian));
+            }
+            sb.Append(" }\n}\n");
+            // 提示无法表达的部分
+            foreach (Segment s in f.Segs)
+            {
+                if (s.Kind == "data" && s.Bytes == 3) warnings.Add("3 字节字段插件不支持，已按保留字节处理（不输出通道）");
+                if (s.Kind == "resv" && (s.Tag == "定长数组" || s.Tag == "变长数组")) warnings.Add(s.Tag + " 插件不支持，仅按 " + s.Bytes + " 字节占位，保证后续字段偏移正确");
+            }
+            return sb.ToString();
+        }
+
+        static string Trim(string hex)
+        {
+            return hex == null ? "" : hex.Trim();
+        }
+
+        public static Frame FromJson(string text)
+        {
+            Dictionary<string, object> root = MiniJson.Parse(text) as Dictionary<string, object>;
+            if (root == null) throw new FormatException("JSON 根节点不是对象");
+            Frame f = new Frame();
+            f.Name = S(root, "name", "MyProtocol");
+            Dictionary<string, object> framing = Sub(root, "framing");
+            string header = "", tail = "";
+            int fixedLen = 0;
+            Dictionary<string, object> lf = null;
+            if (framing != null)
+            {
+                header = S(framing, "header", "");
+                tail = S(framing, "tail", "");
+                fixedLen = I(framing, "fixed_length", 0);
+                lf = Sub(framing, "length_field");
+            }
+            Dictionary<string, object> ck = Sub(root, "checksum");
+            string chkType = ck == null ? "none" : S(ck, "type", "none");
+            int chkOff = ck == null ? -1 : I(ck, "offset", -1);
+            int chkFrom = ck == null ? 0 : I(ck, "range_start", 0);
+            int chkTo = ck == null ? -1 : I(ck, "range_end", -1);
+
+            List<Segment> data = new List<Segment>();
+            List<int> dataOff = new List<int>();
+            List<string> dataName = new List<string>();
+            object fo;
+            if (root.TryGetValue("fields", out fo) && fo != null)
+            {
+                object[] arr = fo as object[];
+                if (arr != null)
+                {
+                    foreach (object o in arr)
+                    {
+                        Dictionary<string, object> d = o as Dictionary<string, object>;
+                        if (d == null) continue;
+                        Segment s = new Segment();
+                        s.Kind = "data";
+                        s.Name = S(d, "name", "field");
+                        s.PType = S(d, "type", "float32");
+                        s.Bytes = PTypes.Width(s.PType);
+                        if (s.Bytes == 0) { s.Bytes = 4; s.PType = "uint32"; }
+                        s.Endian = S(d, "endian", "little");
+                        s.Scale = D(d, "scale", 1.0);
+                        s.Bias = D(d, "bias", 0.0);
+                        data.Add(s);
+                        dataOff.Add(I(d, "offset", 0));
+                        dataName.Add(s.Name);
+                    }
+                }
+            }
+            // 先按偏移排序
+            for (int i = 0; i < data.Count; i++)
+                for (int j = i + 1; j < data.Count; j++)
+                    if (dataOff[j] < dataOff[i])
+                    {
+                        Segment ts = data[i]; data[i] = data[j]; data[j] = ts;
+                        int ti = dataOff[i]; dataOff[i] = dataOff[j]; dataOff[j] = ti;
+                    }
+
+            int headBytes = 0;
+            try { headBytes = HexUtil.ByteCount(HexUtil.Normalize(header)); } catch { headBytes = 0; }
+            int tailBytes = 0;
+            try { tailBytes = HexUtil.ByteCount(HexUtil.Normalize(tail)); } catch { tailBytes = 0; }
+            int total = fixedLen;
+            if (total <= 0)
+            {
+                total = headBytes;
+                for (int i = 0; i < data.Count; i++) if (dataOff[i] + data[i].Bytes > total) total = dataOff[i] + data[i].Bytes;
+                if (chkType != "none" && chkOff >= 0 && chkOff + PTypes.ChkBytes(chkType) > total) total = chkOff + PTypes.ChkBytes(chkType);
+                if (tailBytes > 0 && total < headBytes) total = headBytes + tailBytes;
+                else if (tailBytes > 0 && total == headBytes) total = headBytes + tailBytes;
+            }
+            if (total < headBytes + tailBytes) total = headBytes + tailBytes;
+
+            // 用"字节归属"方式重建段序列
+            string[] owner = new string[total + 4];
+            for (int i = 0; i < owner.Length; i++) owner[i] = "";
+            if (headBytes > 0) for (int i = 0; i < headBytes && i < owner.Length; i++) owner[i] = "h";
+            if (tailBytes > 0) for (int i = total - tailBytes; i < total; i++) if (i >= 0 && i < owner.Length) owner[i] = "t";
+            if (lf != null)
+            {
+                int lo = I(lf, "offset", 0); int lsz = I(lf, "size", 2);
+                for (int i = lo; i < lo + lsz && i < owner.Length; i++) if (i >= 0) owner[i] = "l";
+            }
+            for (int k = 0; k < data.Count; k++)
+                for (int i = dataOff[k]; i < dataOff[k] + data[k].Bytes && i < owner.Length; i++)
+                    if (i >= 0) owner[i] = "d" + k.ToString();
+            if (chkType != "none" && chkOff >= 0)
+            {
+                int cb = PTypes.ChkBytes(chkType);
+                for (int i = chkOff; i < chkOff + cb && i < owner.Length; i++) if (i >= 0) owner[i] = "c";
+            }
+
+            f.Segs.Clear();
+            int pos = 0;
+            while (pos < total)
+            {
+                string o = owner[pos];
+                if (o == "")
+                {
+                    int st = pos;
+                    while (pos < total && owner[pos] == "") pos++;
+                    Segment r = new Segment();
+                    r.Kind = "resv"; r.Tag = "保留"; r.Bytes = pos - st;
+                    f.Segs.Add(r);
+                    continue;
+                }
+                if (o == "h")
+                {
+                    Segment s = new Segment(); s.Kind = "head"; s.Bytes = headBytes; s.Hex = Trim(HexUtil.Normalize(header));
+                    f.Segs.Add(s); pos += headBytes; continue;
+                }
+                if (o == "t")
+                {
+                    Segment s = new Segment(); s.Kind = "tail"; s.Bytes = tailBytes; s.Hex = Trim(HexUtil.Normalize(tail));
+                    f.Segs.Add(s); pos += tailBytes; continue;
+                }
+                if (o == "l")
+                {
+                    Segment s = new Segment(); s.Kind = "len"; s.LenSize = I(lf, "size", 2); s.Bytes = s.LenSize;
+                    s.Endian = S(lf, "endian", "little"); s.LenAdjust = I(lf, "adjust", 0);
+                    f.Segs.Add(s); pos += s.Bytes; continue;
+                }
+                if (o == "c")
+                {
+                    Segment s = new Segment(); s.Kind = "sum"; s.ChkType = chkType; s.Endian = S(ck, "endian", "little");
+                    s.Bytes = PTypes.ChkBytes(chkType); s.RangeFrom = chkFrom;
+                    s.RangeTo = chkTo < 0 ? chkOff : chkTo;
+                    f.Segs.Add(s); pos += s.Bytes; continue;
+                }
+                int idx = 0;
+                int.TryParse(o.Substring(1), out idx);
+                Segment ds = data[idx];
+                ds.Endian = ds.Endian;
+                f.Segs.Add(ds);
+                pos += ds.Bytes;
+            }
+            return f;
+        }
+
+        static Dictionary<string, object> Sub(Dictionary<string, object> d, string k)
+        {
+            object o;
+            if (d != null && d.TryGetValue(k, out o) && o != null) return o as Dictionary<string, object>;
+            return null;
+        }
+        static string S(Dictionary<string, object> d, string k, string def)
+        {
+            object o;
+            if (d != null && d.TryGetValue(k, out o) && o != null) return Convert.ToString(o, CultureInfo.InvariantCulture);
+            return def;
+        }
+        static int I(Dictionary<string, object> d, string k, int def)
+        {
+            object o;
+            if (d != null && d.TryGetValue(k, out o) && o != null) { try { return Convert.ToInt32(o, CultureInfo.InvariantCulture); } catch { return def; } }
+            return def;
+        }
+        static double D(Dictionary<string, object> d, string k, double def)
+        {
+            object o;
+            if (d != null && d.TryGetValue(k, out o) && o != null) { try { return Convert.ToDouble(o, CultureInfo.InvariantCulture); } catch { return def; } }
+            return def;
+        }
+        static string Q(string s)
+        {
+            if (s == null) s = "";
+            StringBuilder sb = new StringBuilder("\"");
+            foreach (char c in s)
+            {
+                if (c == '"') sb.Append("\\\"");
+                else if (c == '\\') sb.Append("\\\\");
+                else if (c == '\n') sb.Append("\\n");
+                else if (c == '\r') sb.Append("\\r");
+                else if (c == '\t') sb.Append("\\t");
+                else sb.Append(c);
+            }
+            sb.Append("\"");
+            return sb.ToString();
+        }
+        static string Num(double v) { return v.ToString("0.############", CultureInfo.InvariantCulture); }
+
+        public static List<string> Validate(Frame f)
+        {
+            List<string> e = new List<string>();
+            if (f.Name == null || f.Name.Trim().Length == 0) e.Add("协议名不能为空");
+            if (f.Segs.Count == 0) e.Add("至少要有一个段（帧头/字段/帧尾…）");
+            int total = f.TotalBytes();
+            if (total <= 0) e.Add("总帧长必须大于 0");
+            Segment head = null, tail = null, len = null, sum = null;
+            foreach (Segment s in f.Segs)
+            {
+                if (s.Kind == "head") head = s;
+                if (s.Kind == "tail") tail = s;
+                if (s.Kind == "len") len = s;
+                if (s.Kind == "sum") sum = s;
+            }
+            try { HexUtil.Normalize(head == null ? "" : head.Hex); } catch (Exception ex) { e.Add("帧头非法：" + ex.Message); }
+            try { HexUtil.Normalize(tail == null ? "" : tail.Hex); } catch (Exception ex) { e.Add("帧尾非法：" + ex.Message); }
+            HashSet<string> names = new HashSet<string>();
+            int i = 0;
+            foreach (Segment s in f.Segs)
+            {
+                int idx = f.OffsetOf(i);
+                if (s.Kind == "data")
+                {
+                    if (s.Name == null || s.Name.Trim().Length == 0) e.Add("第 " + (i + 1) + " 段数据字段名不能为空");
+                    else if (!names.Add(s.Name)) e.Add("数据字段名重复：" + s.Name);
+                    if (PTypes.Width(s.PType) != s.Bytes) e.Add("字段 " + (s.Name.Length > 0 ? s.Name : ("#" + (i + 1))) + " 类型与字节数不匹配");
+                }
+                if (s.Kind == "len")
+                {
+                    if (s.LenSize != 1 && s.LenSize != 2 && s.LenSize != 4) e.Add("帧长度字段宽度只支持 1/2/4");
+                }
+                if (s.Kind == "sum" && s.Export)
+                {
+                    if (s.ChkType != "none" && idx < 0) e.Add("校验段偏移非法");
+                }
+                i++;
+            }
+            if (f.HasVarArray() && len == null) e.Add("含变长数组时必须配置「帧长度」段，且 fixed_length 需要手工在插件里核对");
+            return e;
+        }
+
+        public static List<string> Warnings(Frame f)
+        {
+            List<string> w = new List<string>();
+            List<string> dummy = new List<string>();
+            try { ToJson(f, dummy); } catch { }
+            foreach (string s in dummy)
+            {
+                bool has = false;
+                foreach (string x in w) if (x == s) has = true;
+                if (!has) w.Add(s);
+            }
+            return w;
+        }
+    }
+
+    // ================= 主界面 =================
+class MyGrid : DataGridView { protected override bool ShowFocusCues { get { return false; } } }     class MainForm : Form
+    {
+        Frame frame = Cfg.Default();
+        string path = "";
+        bool loading = false;
+        string cfgFile = Path.Combine(Application.StartupPath, "tool.cfg");
+
+        DataGridView grid;
+        Panel propHost;
+        GroupBox gbTitle, gbHex, gbData, gbResv, gbLen, gbSum;
+        TextBox txtName, hexValue, dName, dScale, dBias, resvLenText;
+        Label lblHexBytes, lblDataBytes, lblResvNote, lblLenNote, lblSumNote, lblSummary;
+        ComboBox dType, dEndian, resvLen, lenSize, lenEndian, sumType, sumFrom, sumTo;
+        NumericUpDown lenAdjust, resvElems;
+        CheckBox dExport, sumEnable;
+        ToolStripStatusLabel slMsg, slPath;
+
+        public MainForm()
+        {
+            Text = "VOFA+ 自定义协议配置工具";
+            AutoScaleMode = AutoScaleMode.None; LoadCfg(); k = ScaleFromCfg(); ClientSize = new Size(S(1220), S(780)); RestoreWinSize(); FormClosing += delegate { SaveWinSize(); };
+            MinimumSize = new Size(S(780), S(520));
+            StartPosition = FormStartPosition.CenterScreen;
+            Font = new Font("Microsoft YaHei UI", 12f * k, GraphicsUnit.Pixel);
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+            BuildUi();
+            string last = LoadLastPath();
+            if (last != null && File.Exists(last)) OpenPath(last);
+            else { ReloadGrid(); }
+        }
+
+        void BuildUi()
+        {
+            MenuStrip menu = new MenuStrip();
+            menu.Items.Add(Menu("文件", new string[] { "打开配置", "保存", "另存为", "重新载入", "-", "退出" }, MenuFile));
+            menu.Items.Add(Menu("视图", new string[] { "预览 JSON" }, MenuView)); menu.Items.Add(Menu("设置", new string[] { "缩放：自动（跟随系统）", "缩放：100%", "缩放：110%", "缩放：125%", "缩放：150%", "缩放：175%", "缩放：200%" }, MenuSettings)); foreach (ToolStripItem mi0 in ((ToolStripMenuItem)menu.Items[menu.Items.Count - 1]).DropDownItems) { string txt0 = mi0.Text; bool on0 = txt0.StartsWith("缩放：自动") ? !cfgMap.ContainsKey("scale") : (cfgMap.ContainsKey("scale") && txt0 == "缩放：" + cfgMap["scale"] + "%"); ((ToolStripMenuItem)mi0).Checked = on0; }
+            menu.Items.Add(Menu("帮助", new string[] { "用法说明", "关于" }, MenuHelp));
+            MainMenuStrip = menu; menu.Font = Font;
+            
+
+            // ---- 添加字段按钮条 ----
+            TableLayoutPanel root = new TableLayoutPanel(); root.Dock = DockStyle.Fill; root.ColumnCount = 1; root.RowCount = 4; root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F)); root.RowStyles.Add(new RowStyle(SizeType.Absolute, S(78))); root.RowStyles.Add(new RowStyle(SizeType.Absolute, S(102))); root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F)); root.RowStyles.Add(new RowStyle(SizeType.Absolute, S(26))); Controls.Add(root); FlowLayoutPanel bar = new FlowLayoutPanel();
+            bar.Dock = DockStyle.Fill;
+            
+            
+            bar.WrapContents = true;
+            string[] btns = new string[] { "帧头", "帧序号", "帧ID", "帧长度", "1Byte", "2Byte", "3Byte", "4Byte", "8Byte", "定长数组", "变长数组", "校验", "帧尾" };
+            foreach (string b in btns)
+            {
+                Button btn = new Button();
+                btn.Text = b;
+                btn.Size = new Size(S(88), S(32));
+                btn.Margin = new Padding(2, 2, 2, 2);
+                btn.Tag = b;
+                btn.Click += AddSegment_Click;
+                bar.Controls.Add(btn);
+            }
+            root.Controls.Add(bar, 0, 0);
+
+            Panel infoPanel = new Panel(); infoPanel.Dock = DockStyle.Fill; Label hint = new Label();
+            hint.AutoSize = false; hint.Height = S(70); hint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right; infoPanel.Resize += delegate { try { hint.Width = infoPanel.ClientSize.Width - S(14); } catch { } };
+            hint.ForeColor = Color.DimGray;
+            hint.Location = new Point(S(6), S(2));
+            hint.Text = "点上面按钮加字段；灰色=只读、黑色=可输入（自动按 HEX 分段并补高位 0）；在 # 列长按 100ms 可拖动排序。\r\n保存后 VOFA+ 约 1 秒热重载，不用重启（数据源需有数据在收）；帧头恒在首行、帧尾恒在末行。\r\n插件限制：校验仅 NONE/SUM8/XOR8/CRC16-MODBUS；数组、3 字节、变长不支持，只能作占位字节。";
+            root.Controls.Add(infoPanel, 0, 1); infoPanel.Controls.Add(hint);
+
+            // ---- 分割区 ----
+            TableLayoutPanel content = new TableLayoutPanel(); content.Dock = DockStyle.Fill; content.ColumnCount = 2; content.RowCount = 1; content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F)); content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(400))); Panel gridHost = new Panel(); gridHost.Dock = DockStyle.Fill; content.Controls.Add(gridHost, 0, 0);
+            
+            
+            
+            
+            root.Controls.Add(content, 0, 2); Resize += delegate { try { content.ColumnStyles[1].Width = S(ClientSize.Width < S(950) ? 340 : 400); } catch { } };
+
+            grid = new MyGrid();
+            grid.Dock = DockStyle.Fill; grid.Paint += delegate(object s6, PaintEventArgs pe2) { int top = grid.ColumnHeadersHeight; for (int i = 0; i < grid.Rows.Count; i++) top += grid.Rows[i].Height; if (top < grid.ClientSize.Height) { pe2.Graphics.FillRectangle(Brushes.White, new Rectangle(0, top, grid.ClientSize.Width, grid.ClientSize.Height - top)); } };
+            grid.AllowUserToAddRows = false;
+            grid.AllowUserToDeleteRows = false;
+            grid.AllowUserToResizeRows = false; grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing; grid.ColumnHeadersHeight = S(34); grid.RowTemplate.Height = S(30); grid.RowHeadersWidth = S(28); grid.CellBorderStyle = DataGridViewCellBorderStyle.None; grid.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None;
+            grid.RowHeadersVisible = false;
+            grid.MultiSelect = false;
+            grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            grid.EditMode = DataGridViewEditMode.EditOnKeystrokeOrF2;
+            grid.BackgroundColor = Color.White;
+            grid.Columns.Add(MkCol("#", S(40), true));
+            grid.Columns.Add(MkCol("名称", S(130), true));
+            DataGridViewTextBoxColumn vcol = MkCol("值", S(300), false); vcol.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill; vcol.MinimumWidth = S(120); grid.Columns.Add(vcol);
+            DataGridViewButtonColumn del = new DataGridViewButtonColumn();
+            del.HeaderText = "";
+            del.Text = "−";
+            del.UseColumnTextForButtonValue = true;
+            del.Width = S(36);
+            del.FlatStyle = FlatStyle.Standard;
+            grid.Columns.Add(del);
+            grid.SelectionChanged += delegate { LoadProps(); }; grid.Leave += delegate { try { grid.EndEdit(); } catch { } };
+            grid.CellEndEdit += delegate { ApplyHexCell(); };
+            grid.EditingControlShowing += Grid_EditingControlShowing; grid.DataError += delegate(object s2, DataGridViewDataErrorEventArgs de) { de.ThrowException = false; Program.LogError(de.Exception); };
+            grid.CellContentClick += Grid_CellContentClick; grid.CellPainting += delegate(object s5, DataGridViewCellPaintingEventArgs e2) { if (e2.ColumnIndex < 0) return; if (e2.RowIndex == -1 && e2.CellBounds.Y >= grid.ColumnHeadersHeight) return; e2.Paint(e2.CellBounds, e2.PaintParts & ~DataGridViewPaintParts.Border & ~DataGridViewPaintParts.Focus); using (Pen pen = new Pen(Color.FromArgb(205, 205, 205))) { e2.Graphics.DrawLine(pen, e2.CellBounds.Left, e2.CellBounds.Bottom - 1, e2.CellBounds.Right - 1, e2.CellBounds.Bottom - 1); e2.Graphics.DrawLine(pen, e2.CellBounds.Left, e2.CellBounds.Top, e2.CellBounds.Left, e2.CellBounds.Bottom - 1); if (e2.ColumnIndex == grid.ColumnCount - 1) e2.Graphics.DrawLine(pen, e2.CellBounds.Right - 1, e2.CellBounds.Top, e2.CellBounds.Right - 1, e2.CellBounds.Bottom - 1); } e2.Handled = true; };
+            gridHost.Controls.Add(grid); gridHost.Controls.Add(GridBar());
+
+            propHost = new Panel(); content.Controls.Add(propHost, 1, 0);
+            propHost.Dock = DockStyle.Fill;
+            propHost.AutoScroll = false;
+            
+
+            gbTitle = new GroupBox();
+            gbTitle.Text = "字段属性设置";
+            gbTitle.Dock = DockStyle.Top;
+            gbTitle.Height = S(30);
+            
+
+            // 帧头 / 帧尾
+            gbHex = new GroupBox();
+            gbHex.Text = "值（十六进制，可输入）";
+            gbHex.Dock = DockStyle.Top;
+            gbHex.Height = S(96);
+            propHost.Controls.Add(gbHex);
+            hexValue = AddText(gbHex, "值", 12, 30, 40, 320);
+            hexValue.CharacterCasing = CharacterCasing.Upper;
+            hexValue.TextChanged += HexBox_TextChanged; hexValue.Leave += delegate { hexValue.Text = PadNibble(hexValue.Text); };
+            lblHexBytes = new Label();
+            lblHexBytes.AutoSize = true;
+            lblHexBytes.ForeColor = Color.DimGray;
+            lblHexBytes.Location = new Point(S(12), S(62));
+            gbHex.Controls.Add(lblHexBytes);
+
+            // 数据字段
+            gbData = new GroupBox();
+            gbData.Text = "数据字段";
+            gbData.Dock = DockStyle.Top;
+            gbData.Height = S(268);
+            propHost.Controls.Add(gbData);
+            dName = AddText(gbData, "名称", 12, 30, 90, 250);
+            dName.TextChanged += delegate { ApplyProps(); };
+            dType = AddCombo(gbData, "数据类型", 12, 66, 90, 250);
+            dType.SelectedIndexChanged += delegate { ApplyProps(); };
+            dEndian = AddCombo(gbData, "字节序", 12, 102, 90, 200, new string[] { "little（小端）", "big（大端）" });
+            dEndian.SelectedIndexChanged += delegate { ApplyProps(); };
+            dScale = AddText(gbData, "倍率 scale", 12, 138, 90, 150);
+            dScale.TextChanged += delegate { ApplyProps(); };
+            dBias = AddText(gbData, "偏置 bias", 12, 172, 90, 150);
+            dBias.TextChanged += delegate { ApplyProps(); };
+            dExport = new CheckBox();
+            dExport.Text = "显示到面板（输出为 VOFA+ 通道）";
+            dExport.AutoSize = true;
+            dExport.Location = new Point(S(12), S(208));
+            dExport.CheckedChanged += delegate { ApplyProps(); };
+            gbData.Controls.Add(dExport);
+            lblDataBytes = new Label();
+            lblDataBytes.AutoSize = true;
+            lblDataBytes.ForeColor = Color.DimGray;
+            lblDataBytes.Location = new Point(S(12), S(236));
+            gbData.Controls.Add(lblDataBytes);
+
+            // 保留段
+            gbResv = new GroupBox();
+            gbResv.Text = "保留段";
+            gbResv.Dock = DockStyle.Top;
+            gbResv.Height = S(150);
+            propHost.Controls.Add(gbResv);
+            resvLen = AddCombo(gbResv, "字节数", 12, 30, 80, 110, new string[] { "1", "2", "3", "4", "6", "8", "12", "16", "32", "64" });
+            resvLen.SelectedIndexChanged += delegate { ApplyProps(); };
+            resvElems = AddNum(gbResv, "元素个数", 12, 66, 80, 90, 1, 1024);
+            resvElems.ValueChanged += delegate { ApplyProps(); };
+            lblResvNote = new Label();
+            lblResvNote.AutoSize = false;
+            lblResvNote.ForeColor = Color.FromArgb(192, 96, 0);
+            lblResvNote.Location = new Point(S(12), S(100));
+            lblResvNote.Size = new Size(S(430), S(40));
+            gbResv.Controls.Add(lblResvNote);
+
+            // 帧长度
+            gbLen = new GroupBox();
+            gbLen.Text = "帧长度字段";
+            gbLen.Dock = DockStyle.Top;
+            gbLen.Height = S(176);
+            propHost.Controls.Add(gbLen);
+            lenSize = AddCombo(gbLen, "宽度 size", 12, 30, 90, 110, new string[] { "1", "2", "4" });
+            lenSize.SelectedIndexChanged += delegate { ApplyProps(); };
+            lenEndian = AddCombo(gbLen, "字节序", 12, 66, 90, 200, new string[] { "little（小端）", "big（大端）" });
+            lenEndian.SelectedIndexChanged += delegate { ApplyProps(); };
+            lenAdjust = AddNum(gbLen, "adjust", 12, 102, 90, 120, -4096, 4096);
+            lenAdjust.ValueChanged += delegate { ApplyProps(); };
+            lblLenNote = new Label();
+            lblLenNote.AutoSize = false;
+            lblLenNote.ForeColor = Color.DimGray;
+            lblLenNote.Location = new Point(S(12), S(134));
+            lblLenNote.Size = new Size(S(430), S(36));
+            gbLen.Controls.Add(lblLenNote);
+
+            // 校验
+            gbSum = new GroupBox();
+            gbSum.Text = "校验";
+            gbSum.Dock = DockStyle.Top;
+            gbSum.Height = S(200);
+            propHost.Controls.Add(gbSum); propHost.Controls.Add(gbTitle); Controls.Add(menu); foreach (GroupBox gg in new GroupBox[] { gbHex, gbData, gbResv, gbLen, gbSum }) foreach (Control cc in gg.Controls) if (cc is TextBox || cc is ComboBox || cc is NumericUpDown) cc.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right; HookDrag(); FlowLayoutPanel flowPanel = new FlowLayoutPanel(); flowPanel.Dock = DockStyle.Fill; flowPanel.FlowDirection = FlowDirection.TopDown; flowPanel.WrapContents = false; flowPanel.AutoScroll = true; propHost.Controls.Add(flowPanel); foreach (Control gg2 in new Control[] { gbTitle, gbHex, gbData, gbResv, gbLen, gbSum }) { propHost.Controls.Remove(gg2); gg2.Dock = DockStyle.None; gg2.Margin = new Padding(0, 0, 0, 6); flowPanel.Controls.Add(gg2); } foreach (Control gg3 in flowPanel.Controls) gg3.Width = Math.Max(S(220), propHost.ClientSize.Width - S(26)); flowPanel.Resize += delegate { foreach (Control gg4 in flowPanel.Controls) gg4.Width = Math.Max(S(220), flowPanel.ClientSize.Width - S(26)); };
+            sumEnable = new CheckBox();
+            sumEnable.Text = "启用校验";
+            sumEnable.AutoSize = true;
+            sumEnable.Location = new Point(S(12), S(30));
+            sumEnable.CheckedChanged += delegate { ApplyProps(); };
+            gbSum.Controls.Add(sumEnable);
+            sumType = AddCombo(gbSum, "校验类型", 12, 62, 90, 240);
+            sumType.SelectedIndexChanged += delegate { ApplyProps(); };
+            sumFrom = AddCombo(gbSum, "校验区间 从", 12, 100, 90, 80);
+            sumFrom.SelectedIndexChanged += delegate { ApplyProps(); };
+            sumTo = AddCombo(gbSum, "到（不含）", 215, 100, 80, 80);
+            sumTo.SelectedIndexChanged += delegate { ApplyProps(); };
+            lblSumNote = new Label();
+            lblSumNote.AutoSize = false;
+            lblSumNote.ForeColor = Color.DimGray;
+            lblSumNote.Location = new Point(S(12), S(132));
+            lblSumNote.Size = new Size(S(430), S(60));
+            lblSumNote.Text = "插件只支持这四种：SUM8（丢弃进位累加）、XOR8、CRC16-MODBUS；\r\n校验区间为左闭右开 [从, 到)。";
+            gbSum.Controls.Add(lblSumNote);
+
+            // 状态栏
+            StatusStrip ss = new StatusStrip(); ss.Font = Font;
+            slMsg = new ToolStripStatusLabel("就绪");
+            slPath = new ToolStripStatusLabel("");
+            slPath.Spring = true;
+            slPath.TextAlign = ContentAlignment.MiddleLeft;
+            ss.Items.Add(slMsg);
+            ss.Items.Add(slPath);
+            root.Controls.Add(ss, 0, 3);
+
+            lblSummary = new Label();
+            lblSummary.AutoSize = true;
+            lblSummary.ForeColor = Color.FromArgb(0, 96, 160);
+            lblSummary.Location = new Point(S(6), S(76));
+            infoPanel.Controls.Add(lblSummary);
+        }
+
+        DataGridViewTextBoxColumn MkCol(string name, int w, bool ro)
+        {
+            DataGridViewTextBoxColumn c = new DataGridViewTextBoxColumn();
+            c.HeaderText = name;
+            c.Width = w;
+            c.ReadOnly = ro;
+            c.SortMode = DataGridViewColumnSortMode.NotSortable;
+            return c;
+        }
+
+        ToolStripMenuItem Menu(string title, string[] items, EventHandler h)
+        {
+            ToolStripMenuItem m = new ToolStripMenuItem(title);
+            foreach (string it in items)
+            {
+                if (it == "-") { m.DropDownItems.Add(new ToolStripSeparator()); continue; }
+                ToolStripMenuItem mi = new ToolStripMenuItem(it);
+                mi.Click += h;
+                m.DropDownItems.Add(mi);
+            }
+            return m;
+        }
+
+        void MenuFile(object sender, EventArgs e)
+        {
+            string t = ((ToolStripMenuItem)sender).Text;
+            if (t == "打开配置") DoOpen();
+            else if (t == "保存") SaveTo(path.Length > 0 ? path : "");
+            else if (t == "另存为") DoSaveAs();
+            else if (t == "重新载入") { if (path.Length > 0) OpenPath(path); }
+            else if (t == "退出") Close();
+        }
+
+        void MenuView(object sender, EventArgs e) { ShowJson(); }
+
+        void MenuHelp(object sender, EventArgs e)
+        {
+            string t = ((ToolStripMenuItem)sender).Text;
+            if (t == "用法说明") ShowHelp();
+            else MessageBox.Show(this, "VOFA+ 自定义协议配置工具（configurable_engine.json 编辑器）\r\n用于图形化编辑协议引擎的配置文件，保存后 VOFA+ 约 1 秒内自动重载。", "关于");
+        }
+
+        TextBox AddText(Control p, string label, int lx, int y, int lw, int w)
+        {
+            lx = S(lx); y = S(y); lw = S(lw); w = S(w); Label l = new Label(); l.Text = label; l.AutoSize = true; l.Location = new Point(lx, y + S(3)); p.Controls.Add(l);
+            TextBox t = new TextBox(); t.Location = new Point(lx + lw, y); t.Width = w; p.Controls.Add(t); return t;
+        }
+
+        NumericUpDown AddNum(Control p, string label, int lx, int y, int lw, int w, int min, int max)
+        {
+            lx = S(lx); y = S(y); lw = S(lw); w = S(w); Label l = new Label(); l.Text = label; l.AutoSize = true; l.Location = new Point(lx, y + S(3)); p.Controls.Add(l);
+            NumericUpDown n = new NumericUpDown(); n.Location = new Point(lx + lw, y); n.Width = w; n.Minimum = min; n.Maximum = max; p.Controls.Add(n); return n;
+        }
+
+        ComboBox AddCombo(Control p, string label, int lx, int y, int lw, int w)
+        {
+            return AddCombo(p, label, lx, y, lw, w, null);
+        }
+
+        ComboBox AddCombo(Control p, string label, int lx, int y, int lw, int w, string[] items)
+        {
+            lx = S(lx); y = S(y); lw = S(lw); w = S(w); Label l = new Label(); l.Text = label; l.AutoSize = true; l.Location = new Point(lx, y + S(3)); p.Controls.Add(l);
+            ComboBox c = new ComboBox(); c.DropDownStyle = ComboBoxStyle.DropDownList; c.Location = new Point(lx + lw, y); c.Width = w;
+            if (items != null) c.Items.AddRange(items);
+            p.Controls.Add(c); return c;
+        }
+
+        bool inReload = false; bool reloadPending = false;
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string win); [System.Runtime.InteropServices.DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h); float k = 1f; int S(int v){ return (int)Math.Round(v * k); } float SystemDpi(){ try { IntPtr t = FindWindow("Shell_TrayWnd", null); uint d = GetDpiForWindow(t); if (d >= 96 && d <= 480) return (float)d; } catch { } return 96f; } Dictionary<string,string> cfgMap = new Dictionary<string,string>(); void LoadCfg(){ try { if (File.Exists(cfgFile)) foreach (string l in File.ReadAllLines(cfgFile)) { int ix = l.IndexOf('='); if (ix > 0) cfgMap[l.Substring(0, ix).Trim()] = l.Substring(ix + 1).Trim(); } } catch { } } void SaveCfg(){ try { StringBuilder sb = new StringBuilder(); foreach (KeyValuePair<string,string> kv in cfgMap) sb.Append(kv.Key).Append('=').Append(kv.Value).Append("\r\n"); File.WriteAllText(cfgFile, sb.ToString(), new UTF8Encoding(false)); } catch { } } float ScaleFromCfg(){ string v; int p; if (cfgMap.TryGetValue("scale", out v) && int.TryParse(v, out p) && p >= 50 && p <= 300) return p / 100f; return SystemDpi() / 96f; } void RestoreWinSize(){ string v; if (!cfgMap.TryGetValue("win", out v)) return; string[] pp = v.Split('x'); int w2, h2; if (pp.Length == 2 && int.TryParse(pp[0], out w2) && int.TryParse(pp[1], out h2) && w2 >= 400 && w2 <= 4000 && h2 >= 300 && h2 <= 3000) { try { ClientSize = new Size(S(w2), S(h2)); } catch { } } } void SaveWinSize(){ try { cfgMap["win"] = ((int)Math.Round(ClientSize.Width / k)) + "x" + ((int)Math.Round(ClientSize.Height / k)); SaveCfg(); } catch { } } void MenuSettings(object sender, EventArgs e){ ToolStripMenuItem mi = (ToolStripMenuItem)sender; string t = mi.Text; int p = 0; if (!t.StartsWith("缩放：自动")) { int.TryParse(t.Substring(3).Replace("%", ""), out p); } if (p <= 0) cfgMap.Remove("scale"); else cfgMap["scale"] = p.ToString(); SaveCfg(); if (mi.OwnerItem != null) { foreach (ToolStripItem it in ((ToolStripMenuItem)mi.OwnerItem).DropDownItems) { ToolStripMenuItem m2 = it as ToolStripMenuItem; if (m2 != null) m2.Checked = (m2 == mi); } } slMsg.Text = "缩放已设为 " + (p <= 0 ? "自动" : p + "%") + "，重启工具后生效"; } string CellValueText(Segment s){ if (s.Kind == "head" || s.Kind == "tail") return s.Hex; if (s.Kind == "sum") return s.Export ? frame.ZeroText(s.Bytes) : "—"; if (s.Kind == "len") return frame.ZeroText(s.LenSize); return frame.ZeroText(s.Bytes); } void RefreshRows(){ try { for (int i = 0; i < frame.Segs.Count && i < grid.Rows.Count; i++) { grid.Rows[i].Cells[0].Value = i.ToString(); grid.Rows[i].Cells[1].Value = frame.KindName(frame.Segs[i]); grid.Rows[i].Cells[2].Value = CellValueText(frame.Segs[i]); } } catch { } } ToolTip tip = new ToolTip(); string AskName(string cur){ Form d = new Form(); d.Text = "保存前确认协议名"; d.StartPosition = FormStartPosition.CenterParent; d.FormBorderStyle = FormBorderStyle.FixedDialog; d.MinimizeBox = false; d.MaximizeBox = false; d.AutoScaleMode = AutoScaleMode.None; d.Font = new Font("Microsoft YaHei UI", 12f * k, GraphicsUnit.Pixel); d.ClientSize = new Size(S(450), S(176)); Label lb = new Label(); lb.Font = d.Font; lb.Text = "协议名（写入 JSON 的 name 字段；不改就保持原样直接确定）"; lb.AutoSize = true; lb.Location = new Point(S(16), S(14)); d.Controls.Add(lb); TextBox tb = new TextBox(); tb.Font = d.Font; tb.Text = cur; tb.Location = new Point(S(16), S(56)); tb.Width = S(418); d.Controls.Add(tb); Button ok = new Button(); ok.Font = d.Font; ok.Text = "确定"; ok.DialogResult = DialogResult.OK; ok.Location = new Point(S(214), S(116)); ok.Size = new Size(S(104), S(40)); d.Controls.Add(ok); Button no = new Button(); no.Font = d.Font; no.Text = "取消保存"; no.DialogResult = DialogResult.Cancel; no.Location = new Point(S(330), S(116)); no.Size = new Size(S(104), S(40)); d.Controls.Add(no); d.AcceptButton = ok; d.CancelButton = no; tb.SelectAll(); if (d.ShowDialog(this) == DialogResult.OK) { string v = tb.Text.Trim(); return v.Length > 0 ? v : cur; } return null; } void Repin(){ Segment head = null; Segment tail = null; List<Segment> rest = new List<Segment>(); foreach (Segment s in frame.Segs) { if (s.Kind == "head" && head == null) head = s; else if (s.Kind == "tail" && tail == null) tail = s; else rest.Add(s); } frame.Segs.Clear(); if (head != null) frame.Segs.Add(head); frame.Segs.AddRange(rest); if (tail != null) frame.Segs.Add(tail); } int FindKind(string k){ for (int i = 0; i < frame.Segs.Count; i++) if (frame.Segs[i].Kind == k) return i; return -1; } Button Btn(string text, EventHandler h)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.Size = new Size(S(76), S(28));
+            b.Margin = new Padding(2, 2, 2, 2);
+            b.Click += h;
+            return b;
+        }
+
+        Panel GridBar()
+        {
+            FlowLayoutPanel p = new FlowLayoutPanel();
+            p.Dock = DockStyle.Top;
+            p.Height = S(36);
+            p.WrapContents = false;
+            p.Controls.Add(Btn("保存", delegate { SaveTo(path); })); p.Controls.Add(Btn("↑ 上移", delegate { MoveSeg(-1); }));
+            p.Controls.Add(Btn("↓ 下移", delegate { MoveSeg(1); }));
+            p.Controls.Add(Btn("复制", delegate { DupSeg(); }));
+            p.Controls.Add(Btn("删除", delegate { DelSeg(); }));
+            return p;
+        }
+
+        void MoveSeg(int d)
+        {
+            int i = Sel();
+            if (i < 0) return;
+            int j = i + d;
+            if (j < 0 || j >= frame.Segs.Count) return;
+            Segment t = frame.Segs[i];
+            frame.Segs[i] = frame.Segs[j];
+            frame.Segs[j] = t;
+            ReloadGrid();
+            SelectRow(j);
+        }
+
+        void DupSeg()
+        {
+            int i = Sel();
+            if (i < 0) return;
+            if (frame.Segs[i].Kind == "head" || frame.Segs[i].Kind == "tail") { slMsg.Text = "帧头/帧尾位置固定，不能复制"; return; } Segment c = CloneSeg(frame.Segs[i]);
+            frame.Segs.Insert(i + 1, c);
+            ReloadGrid();
+            SelectRow(i + 1);
+        }
+
+        void DelSeg()
+        {
+            int i = Sel();
+            if (i < 0) return;
+            frame.Segs.RemoveAt(i);
+            ReloadGrid();
+        }
+
+        Segment CloneSeg(Segment s)
+        {
+            Segment c = new Segment();
+            c.Kind = s.Kind; c.Tag = s.Tag; c.Bytes = s.Bytes; c.Hex = s.Hex; c.Name = s.Name;
+            c.PType = s.PType; c.Endian = s.Endian; c.Scale = s.Scale; c.Bias = s.Bias; c.Export = s.Export;
+            c.LenSize = s.LenSize; c.LenAdjust = s.LenAdjust; c.ChkType = s.ChkType;
+            c.RangeFrom = s.RangeFrom; c.RangeTo = s.RangeTo; c.ElemCount = s.ElemCount;
+            return c;
+        }
+
+        string PadNibble(string raw){ StringBuilder sb = new StringBuilder(); foreach (char c in raw) if (HexUtil.IsHexChar(c)) sb.Append(char.ToUpperInvariant(c)); string h = sb.ToString(); if (h.Length == 0) return ""; if (h.Length % 2 != 0) h = h.Substring(0, h.Length - 1) + "0" + h.Substring(h.Length - 1); StringBuilder o = new StringBuilder(); for (int i = 0; i < h.Length; i += 2){ if (i > 0) o.Append(' '); o.Append(h[i]); o.Append(h[i + 1]); } return o.ToString(); }
+
+        // ---------- # 列长按拖动排序 ----------
+        int dragFrom = -1;
+        bool dragArmed = false;
+        Point dragStart = Point.Empty;
+        Timer dragTimer;
+
+        void HookDrag()
+        {
+            dragTimer = new Timer();
+            dragTimer.Interval = 100;
+            dragTimer.Tick += delegate
+            {
+                dragTimer.Stop();
+                if (dragFrom >= 0) { dragArmed = true; grid.Cursor = Cursors.SizeAll; }
+            };
+            grid.MouseDown += delegate(object o, MouseEventArgs e)
+            {
+                if (e.Button != MouseButtons.Left) return;
+                DataGridView.HitTestInfo h = grid.HitTest(e.X, e.Y);
+                try { grid.EndEdit(); } catch { } if (h.RowIndex >= 0 && h.ColumnIndex == 0)
+                {
+                    dragFrom = h.RowIndex;
+                    dragStart = new Point(e.X, e.Y);
+                    dragTimer.Start();
+                }
+            };
+            grid.MouseMove += delegate(object o, MouseEventArgs e)
+            {
+                if (dragFrom < 0) return;
+                if (!dragArmed)
+                {
+                    if (Math.Abs(e.X - dragStart.X) > 8 || Math.Abs(e.Y - dragStart.Y) > 8) { dragTimer.Stop(); dragFrom = -1; }
+                    return;
+                }
+                DataGridView.HitTestInfo h = grid.HitTest(e.X, e.Y);
+                if (h.RowIndex >= 0 && h.RowIndex != dragFrom)
+                {
+                    int to = h.RowIndex;
+                    Segment s = frame.Segs[dragFrom];
+                    frame.Segs.RemoveAt(dragFrom);
+                    frame.Segs.Insert(to, s);
+                    dragFrom = to;
+                    RefreshRows();
+                    SelectRow(to);
+                }
+            };
+            grid.MouseUp += delegate
+            {
+                bool wasDrag = dragArmed;
+                dragTimer.Stop();
+                dragArmed = false;
+                dragFrom = -1;
+                grid.Cursor = Cursors.Default;
+                if (wasDrag) ReloadGrid();
+            };
+        }
+
+        // ---------- 添加段 ----------
+
+        void AddSegment_Click(object sender, EventArgs e)
+        {
+            try { grid.EndEdit(); } catch { } string tag = (string)((Button)sender).Tag;
+            Segment s = null;
+            if (tag == "帧头") { s = new Segment(); s.Kind = "head"; s.Hex = "AA 55"; s.Bytes = 2; }
+            else if (tag == "帧尾") { s = new Segment(); s.Kind = "tail"; s.Hex = "0D 0A"; s.Bytes = 2; }
+            else if (tag == "帧序号") { s = new Segment(); s.Kind = "resv"; s.Tag = "帧序号"; s.Bytes = 1; }
+            else if (tag == "帧ID") { s = new Segment(); s.Kind = "resv"; s.Tag = "帧ID"; s.Bytes = 1; }
+            else if (tag == "帧长度") { s = new Segment(); s.Kind = "len"; s.LenSize = 2; s.LenAdjust = 0; s.Bytes = 2; }
+            else if (tag == "校验") { s = new Segment(); s.Kind = "sum"; s.ChkType = "sum8"; s.Export = true; s.Bytes = 1; s.RangeTo = -1; }
+            else if (tag == "定长数组") { s = new Segment(); s.Kind = "resv"; s.Tag = "定长数组"; s.Bytes = 8; s.ElemCount = 8; }
+            else if (tag == "变长数组") { s = new Segment(); s.Kind = "resv"; s.Tag = "变长数组"; s.Bytes = 0; }
+            else if (tag == "3Byte") { s = new Segment(); s.Kind = "data"; s.Name = ""; s.PType = "uint32"; s.Bytes = 3; s.Export = false; }
+            else
+            {
+                int w = 1;
+                if (tag == "2Byte") w = 2; else if (tag == "4Byte") w = 4; else if (tag == "8Byte") w = 8;
+                string[] ts = PTypes.ForWidth(w);
+                s = new Segment(); s.Kind = "data"; s.PType = ts[0]; s.Bytes = w; s.Name = "field" + (CountData() + 1);
+            }
+            Repin(); if (tag == "帧头" || tag == "帧尾") { int ex = FindKind(tag == "帧头" ? "head" : "tail"); if (ex >= 0) { SelectRow(ex); slMsg.Text = tag + "已经存在，位置固定：帧头在最前、帧尾在最后"; return; } } int at = frame.Segs.Count;
+            if (grid.CurrentRow != null && grid.CurrentRow.Index >= 0) at = grid.CurrentRow.Index + 1;
+            if (s.Kind == "head") at = 0; else { int tl = FindKind("tail"); if (tl >= 0 && at > tl) at = tl; } frame.Segs.Insert(at, s);
+            ReloadGrid();
+            SelectRow(at);
+        }
+
+        int CountData()
+        {
+            int n = 0;
+            foreach (Segment s in frame.Segs) if (s.Kind == "data") n++;
+            return n;
+        }
+
+        // ---------- 表格 ----------
+        void ReloadGrid(){ if (inReload) { reloadPending = true; return; } if (IsHandleCreated && grid.IsCurrentCellInEditMode) { if (!reloadPending) { reloadPending = true; BeginInvoke(new MethodInvoker(delegate { reloadPending = false; ReloadGrid(); })); } return; } inReload = true; try { ReloadGridCore(); } finally { inReload = false; } if (reloadPending) { reloadPending = false; ReloadGrid(); } } void ReloadGridCore()
+        {
+            loading = true;
+            Repin(); int sel = grid.CurrentRow == null ? 0 : grid.CurrentRow.Index;
+            grid.Rows.Clear();
+            for (int i = 0; i < frame.Segs.Count; i++)
+            {
+                Segment s = frame.Segs[i];
+                string name = frame.KindName(s);
+                string val;
+                bool editable = false;
+                if (s.Kind == "head" || s.Kind == "tail") { val = s.Hex; editable = true; }
+                else if (s.Kind == "data") val = frame.ZeroText(s.Bytes);
+                else if (s.Kind == "len") val = frame.ZeroText(s.LenSize);
+                else if (s.Kind == "sum") val = s.Export ? frame.ZeroText(s.Bytes) : "—";
+                else val = frame.ZeroText(s.Bytes);
+                int r = grid.Rows.Add((i).ToString(), name, val, "");
+                DataGridViewCell c = grid.Rows[r].Cells[2];
+                c.ReadOnly = !editable;
+                c.Style.ForeColor = editable ? Color.Black : Color.Silver;
+                c.Style.BackColor = editable ? Color.White : Color.FromArgb(246, 246, 246);
+                if (i == frame.Segs.Count - 1) { }
+            }
+            loading = false;
+            if (sel >= frame.Segs.Count) sel = frame.Segs.Count - 1;
+            SelectRow(sel); LoadProps(); try { grid.Invalidate(); grid.Update(); } catch { }
+            UpdateSummary();
+        }
+
+        void SelectRow(int i)
+        {
+            if (i < 0 || i >= grid.Rows.Count) return;
+            grid.ClearSelection();
+            grid.Rows[i].Selected = true;
+            try { grid.CurrentCell = grid.Rows[i].Cells[0]; } catch { }
+            LoadProps();
+        }
+
+        int Sel()
+        {
+            if (grid.CurrentRow == null) return -1;
+            return grid.CurrentRow.Index;
+        }
+
+        void UpdateSummary()
+        {
+            int total = frame.TotalBytes();
+            StringBuilder sb = new StringBuilder();
+            sb.Append("总帧长 ").Append(total).Append(" 字节：");
+            foreach (Segment s in frame.Segs)
+            {
+                if (s.Kind == "head") sb.Append("帧头 ").Append(s.Bytes);
+                else if (s.Kind == "tail") sb.Append("帧尾 ").Append(s.Bytes);
+                else if (s.Kind == "data") sb.Append((s.Name.Length > 0 ? s.Name : "字段")).Append(" ").Append(s.Bytes);
+                else if (s.Kind == "len") sb.Append("帧长度 ").Append(s.Bytes);
+                else if (s.Kind == "sum") sb.Append("校验 ").Append(s.Bytes);
+                else sb.Append(s.Tag).Append(" ").Append(s.Bytes);
+                sb.Append(" + ");
+            }
+            string t = sb.ToString();
+            if (t.EndsWith(" + ")) t = t.Substring(0, t.Length - 3);
+            int nf0 = 0; foreach (Segment s2 in frame.Segs) if (s2.Kind == "data" && s2.Export) nf0++; lblSummary.Text = "总帧长 " + total + " 字节 · 输出通道 " + nf0 + " 个"; try { tip.SetToolTip(lblSummary, t); } catch { }
+            List<string> errs = Cfg.Validate(frame);
+            if (errs.Count > 0) { lblSummary.ForeColor = Color.Firebrick; slMsg.Text = "有问题：" + errs[0] + (errs.Count > 1 ? " 等 " + errs.Count + " 项" : ""); }
+            else { lblSummary.ForeColor = Color.FromArgb(0, 96, 160); slMsg.Text = "校验通过（总帧长 " + total + " 字节）"; }
+            slPath.Text = path.Length == 0 ? "尚未选择配置文件" : path;
+        }
+
+        // ---------- 属性面板 ----------
+        void LoadProps()
+        {
+            if (loading) return;
+            int i = Sel();
+            gbHex.Visible = gbData.Visible = gbResv.Visible = gbLen.Visible = gbSum.Visible = false;
+            if (i < 0 || i >= frame.Segs.Count) return;
+            Segment s = frame.Segs[i];
+            loading = true;
+            if (s.Kind == "head" || s.Kind == "tail")
+            {
+                gbHex.Visible = true;
+                hexValue.Text = s.Hex;
+                lblHexBytes.Text = "占 " + s.Bytes + " 字节（输入自动按两位一组分段）";
+            }
+            else if (s.Kind == "data")
+            {
+                gbData.Visible = true;
+                dName.Text = s.Name;
+                dType.Items.Clear();
+                if (s.Bytes == 3)
+                {
+                    dType.Items.Add(new TypeItem("uint32"));
+                    dType.Enabled = false;
+                    lblDataBytes.Text = "3 字节：插件不支持 3 字节类型，该段只占位、不输出通道";
+                }
+                else
+                {
+                    dType.Enabled = true;
+                    foreach (string t in PTypes.ForWidth(s.Bytes)) dType.Items.Add(new TypeItem(t));
+                    lblDataBytes.Text = "占 " + s.Bytes + " 字节，偏移 " + frame.OffsetOf(i);
+                    for (int k = 0; k < dType.Items.Count; k++)
+                        if (((TypeItem)dType.Items[k]).Type == s.PType) dType.SelectedIndex = k;
+                    if (dType.SelectedIndex < 0) dType.SelectedIndex = 0;
+                }
+                dEndian.SelectedIndex = s.Endian == "big" ? 1 : 0;
+                dScale.Text = s.Scale.ToString("0.############", CultureInfo.InvariantCulture);
+                dBias.Text = s.Bias.ToString("0.############", CultureInfo.InvariantCulture);
+                dExport.Checked = s.Export;
+            }
+            else if (s.Kind == "len")
+            {
+                gbLen.Visible = true;
+                lenSize.SelectedItem = s.LenSize.ToString();
+                if (lenSize.SelectedIndex < 0) lenSize.SelectedIndex = 1;
+                lenEndian.SelectedIndex = s.Endian == "big" ? 1 : 0;
+                lenAdjust.Value = s.LenAdjust;
+                lblLenNote.Text = "完整帧长 = 该字段的值 + adjust（该段位于偏移 " + frame.OffsetOf(i) + "）";
+            }
+            else if (s.Kind == "sum")
+            {
+                gbSum.Visible = true;
+                sumEnable.Checked = s.Export;
+                sumType.Items.Clear();
+                foreach (string t in PTypes.Checksums) sumType.Items.Add(new TypeItem(t));
+                for (int k = 0; k < sumType.Items.Count; k++)
+                    if (((TypeItem)sumType.Items[k]).Type == s.ChkType) sumType.SelectedIndex = k;
+                if (sumType.SelectedIndex < 0) sumType.SelectedIndex = 1;
+                int total = frame.TotalBytes();
+                sumFrom.Items.Clear(); sumTo.Items.Clear();
+                for (int k = 0; k < total; k++) { sumFrom.Items.Add(k.ToString()); sumTo.Items.Add(k.ToString()); }
+                if (s.RangeFrom < total && s.RangeFrom >= 0) sumFrom.SelectedItem = s.RangeFrom.ToString(); else if (sumFrom.Items.Count > 0) sumFrom.SelectedIndex = 0;
+                int to = s.RangeTo < 0 ? frame.OffsetOf(i) : s.RangeTo;
+                if (to < total && to >= 0 && sumTo.Items.Count > 0) sumTo.SelectedItem = to.ToString(); else if (sumTo.Items.Count > 0) sumTo.SelectedIndex = sumTo.Items.Count - 1;
+            }
+            else
+            {
+                gbResv.Visible = true;
+                resvLen.SelectedItem = s.Bytes.ToString();
+                if (resvLen.SelectedIndex < 0) resvLen.Text = s.Bytes.ToString();
+                resvElems.Value = s.ElemCount < resvElems.Minimum ? resvElems.Minimum : (s.ElemCount > resvElems.Maximum ? resvElems.Maximum : s.ElemCount);
+                if (s.Tag == "定长数组") lblResvNote.Text = "插件不支持数组解析：该段仅占 " + s.Bytes + " 字节，保证后续字段偏移正确。";
+                else if (s.Tag == "变长数组") lblResvNote.Text = "插件不支持变长数组：请填一个名义字节数，并务必配置「帧长度」段。";
+                else lblResvNote.Text = "插件不解析该段，仅占 " + s.Bytes + " 字节。";
+            }
+            loading = false;
+        }
+
+        void ApplyProps()
+        {
+            if (loading) return;
+            int i = Sel();
+            if (i < 0 || i >= frame.Segs.Count) return;
+            Segment s = frame.Segs[i];
+            bool needReload = false;
+            if (s.Kind == "data")
+            {
+                s.Name = dName.Text;
+                if (dType.SelectedItem != null && s.Bytes != 3) s.PType = ((TypeItem)dType.SelectedItem).Type;
+                s.Endian = dEndian.SelectedIndex == 1 ? "big" : "little";
+                double v;
+                if (double.TryParse(dScale.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) s.Scale = v;
+                if (double.TryParse(dBias.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) s.Bias = v;
+                s.Export = dExport.Checked && s.Bytes != 3;
+                try { grid.Rows[i].Cells[1].Value = frame.KindName(s); } catch { }
+            }
+            else if (s.Kind == "len")
+            {
+                int n = 2;
+                if (lenSize.SelectedItem != null) int.TryParse(lenSize.SelectedItem.ToString(), out n);
+                if (n != s.LenSize) needReload = true;
+                s.LenSize = n; s.Bytes = n;
+                s.Endian = lenEndian.SelectedIndex == 1 ? "big" : "little";
+                s.LenAdjust = (int)lenAdjust.Value;
+            }
+            else if (s.Kind == "sum")
+            {
+                if (sumType.SelectedItem != null) s.ChkType = ((TypeItem)sumType.SelectedItem).Type;
+                s.Export = sumEnable.Checked;
+                if (s.ChkType == "none") s.Export = false;
+                int nb = PTypes.ChkBytes(s.ChkType);
+                if (nb != s.Bytes) needReload = true;
+                s.Bytes = nb;
+                int a;
+                if (sumFrom.SelectedItem != null && int.TryParse(sumFrom.SelectedItem.ToString(), out a)) s.RangeFrom = a;
+                if (sumTo.SelectedItem != null && int.TryParse(sumTo.SelectedItem.ToString(), out a)) s.RangeTo = a;
+            }
+            else if (s.Kind == "resv")
+            {
+                int n = s.Bytes;
+                if (resvLen.SelectedItem != null) int.TryParse(resvLen.SelectedItem.ToString(), out n);
+                if (n != s.Bytes) needReload = true;
+                s.Bytes = n;
+                s.ElemCount = (int)resvElems.Value;
+            }
+            if (needReload) ReloadGrid(); else { UpdateSummary(); RefreshRowValue(i); }
+        }
+
+        void RefreshRowValue(int i)
+        {
+            if (i < 0 || i >= grid.Rows.Count || i >= frame.Segs.Count) return;
+            Segment s = frame.Segs[i];
+            DataGridViewCell c = grid.Rows[i].Cells[2];
+            if (s.Kind == "head" || s.Kind == "tail") { c.Value = s.Hex; c.ReadOnly = false; c.Style.ForeColor = Color.Black; c.Style.BackColor = Color.White; }
+            else
+            {
+                c.Value = (s.Kind == "sum" && !s.Export) ? "—" : frame.ZeroText(s.Bytes);
+                c.ReadOnly = true; c.Style.ForeColor = Color.Silver; c.Style.BackColor = Color.FromArgb(246, 246, 246);
+            }
+        }
+
+        // ---------- hex 输入联动 ----------
+        void HexBox_TextChanged(object sender, EventArgs e)
+        {
+            if (loading) return;
+            TextBox tb = (TextBox)sender;
+            int caret = tb.SelectionStart;
+            string fmt = SafeFormat(tb.Text, ref caret);
+            if (fmt != tb.Text) { tb.Text = fmt; tb.SelectionStart = Math.Min(caret, fmt.Length); }
+            int i = Sel();
+            if (i >= 0 && i < frame.Segs.Count)
+            {
+                Segment s = frame.Segs[i];
+                if (s.Kind == "head" || s.Kind == "tail")
+                {
+                    s.Hex = tb.Text;
+                    try { s.Bytes = HexUtil.ByteCount(HexUtil.Normalize(s.Hex)); } catch { }
+                    try { if (i < grid.Rows.Count) grid.Rows[i].Cells[2].Value = s.Hex; } catch { }
+                    lblHexBytes.Text = "占 " + s.Bytes + " 字节（输入自动按两位一组分段）";
+                    UpdateSummary();
+                }
+            }
+        }
+
+        void Grid_EditingControlShowing(object sender, DataGridViewEditingControlShowingEventArgs e)
+        {
+            TextBox tb = e.Control as TextBox;
+            if (tb == null) return;
+            tb.TextChanged -= GridHex_TextChanged;
+            if (grid.CurrentCell != null && grid.CurrentCell.ColumnIndex == 2 && !grid.CurrentCell.ReadOnly)
+                tb.TextChanged += GridHex_TextChanged;
+        }
+
+        void GridHex_TextChanged(object sender, EventArgs e)
+        {
+            TextBox tb = (TextBox)sender;
+            int caret = tb.SelectionStart;
+            string fmt = SafeFormat(tb.Text, ref caret);
+            if (fmt != tb.Text) { tb.Text = fmt; tb.SelectionStart = Math.Min(caret, fmt.Length); }
+        }
+
+        string SafeFormat(string raw, ref int caret)
+        {
+            int valid = 0;
+            for (int i = 0; i < raw.Length && i < caret; i++) if (HexUtil.IsHexChar(raw[i])) valid++;
+            StringBuilder sb = new StringBuilder();
+            foreach (char c in raw) if (HexUtil.IsHexChar(c)) sb.Append(char.ToUpperInvariant(c));
+            string h = sb.ToString();
+            StringBuilder o = new StringBuilder();
+            for (int i = 0; i < h.Length; i += 2)
+            {
+                if (i > 0) o.Append(' ');
+                o.Append(h[i]);
+                if (i + 1 < h.Length) o.Append(h[i + 1]);
+            }
+            string res = o.ToString();
+            int pos = 0, cnt = 0;
+            while (pos < res.Length && cnt < valid) { if (HexUtil.IsHexChar(res[pos])) cnt++; pos++; }
+            if (pos < res.Length && res[pos] == ' ') pos++;
+            caret = pos;
+            return res;
+        }
+
+        void ApplyHexCell()
+        {
+            int i = Sel();
+            if (i < 0 || i >= frame.Segs.Count) return;
+            Segment s = frame.Segs[i];
+            if (s.Kind != "head" && s.Kind != "tail") return;
+            object v = grid.Rows[i].Cells[2].Value;
+            s.Hex = PadNibble(v == null ? "" : v.ToString());
+            try { s.Bytes = HexUtil.ByteCount(HexUtil.Normalize(s.Hex)); }
+            catch { MessageBox.Show(this, "十六进制格式不正确：" + s.Hex, "提示"); }
+            ReloadGrid();
+        }
+
+        void Grid_CellContentClick(object sender, DataGridViewCellEventArgs e)
+        {
+            if (e.RowIndex < 0) return;
+            try { grid.EndEdit(); } catch { } if (grid.Columns[e.ColumnIndex] is DataGridViewButtonColumn)
+            {
+                if (e.RowIndex < frame.Segs.Count)
+                {
+                    frame.Segs.RemoveAt(e.RowIndex);
+                    ReloadGrid();
+                }
+            }
+        }
+
+        // ---------- 文件 ----------
+        string LoadLastPath()
+        {
+            try
+            {
+                if (File.Exists(cfgFile))
+                {
+                    string[] lines = File.ReadAllLines(cfgFile);
+                    foreach (string l in lines) { int ix = l.IndexOf('='); if (ix > 0) cfgMap[l.Substring(0, ix).Trim()] = l.Substring(ix + 1).Trim(); } string pv; if (cfgMap.TryGetValue("path", out pv)) return pv;
+                }
+            }
+            catch { }
+            string[] cands = new string[] {
+                @"C:\Program Files\VOFA+\plugins\dataengines\configurable_engine.json",
+                @"C:\Program Files (x86)\VOFA+\plugins\dataengines\configurable_engine.json"
+            };
+            foreach (string c in cands) if (File.Exists(c)) return c;
+            return null;
+        }
+
+        void SaveLastPath(string p)
+        {
+            try { cfgMap["path"] = p; SaveCfg(); } catch { }
+        }
+
+        void DoOpen()
+        {
+            OpenFileDialog d = new OpenFileDialog();
+            d.Filter = "协议配置 (*.json)|*.json|所有文件 (*.*)|*.*";
+            d.InitialDirectory = path.Length > 0 ? Path.GetDirectoryName(path) : Application.StartupPath;
+            if (d.ShowDialog(this) == DialogResult.OK) OpenPath(d.FileName);
+        }
+
+        public void OpenPath(string p)
+        {
+            try
+            {
+                if (!File.Exists(p)) { MessageBox.Show(this, "文件不存在：" + p, "提示"); return; }
+                byte[] raw = File.ReadAllBytes(p);
+                string head = Encoding.ASCII.GetString(raw, 0, Math.Min(raw.Length, 16));
+                if (head.IndexOf('{') < 0)
+                {
+                    DialogResult r = MessageBox.Show(this,
+                        "该文件无法解析为协议配置。" +
+                        "现在用默认示例覆盖它吗？", "文件无法解析", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (r == DialogResult.Yes) { frame = Cfg.Default(); path = p; ReloadGrid(); SaveTo(p); }
+                    return;
+                }
+                string text = Encoding.UTF8.GetString(raw);
+                if (text.Length > 0 && text[0] == '\uFEFF') text = text.Substring(1);
+                frame = Cfg.FromJson(text);
+                path = p;
+                ReloadGrid();
+                SaveLastPath(p);
+                slMsg.Text = "已载入 " + Path.GetFileName(p);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "读取/解析失败：\r\n" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        void DoSaveAs()
+        {
+            SaveFileDialog d = new SaveFileDialog();
+            d.Filter = "协议配置 (*.json)|*.json|所有文件 (*.*)|*.*";
+            d.FileName = "configurable_engine.json";
+            d.InitialDirectory = path.Length > 0 ? Path.GetDirectoryName(path) : Application.StartupPath;
+            if (d.ShowDialog(this) == DialogResult.OK) { path = d.FileName; SaveTo(path); }
+        }
+
+        public void SaveTo(string p)
+        {
+            if (p == null || p.Length == 0) { DoSaveAs(); return; }
+            try
+            {
+                string nn = AskName(frame.Name); if (nn == null) { slMsg.Text = "已取消保存"; return; } if (nn.Length > 0) frame.Name = nn; List<string> errs = Cfg.Validate(frame);
+                if (errs.Count > 0)
+                {
+                    StringBuilder sb = new StringBuilder("配置不合法，未保存：\r\n\r\n");
+                    foreach (string s in errs) sb.Append("  • ").Append(s).Append("\r\n");
+                    MessageBox.Show(this, sb.ToString(), "校验失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                List<string> warn = Cfg.Warnings(frame);
+                if (warn.Count > 0)
+                {
+                    StringBuilder sb = new StringBuilder("提示（可继续保存）：\r\n\r\n");
+                    foreach (string s in warn) sb.Append("  • ").Append(s).Append("\r\n");
+                    sb.Append("\r\n仍然保存？");
+                    if (MessageBox.Show(this, sb.ToString(), "确认", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return;
+                }
+                List<string> w2 = new List<string>();
+                string json = Cfg.ToJson(frame, w2);
+                File.WriteAllText(p, json, new UTF8Encoding(false));
+                path = p;
+                SaveLastPath(p);
+                Text = "VOFA+ 自定义协议配置工具   [" + p + "]";
+                slMsg.Text = "已保存 " + DateTime.Now.ToString("HH:mm:ss") + "（VOFA+ 约 1 秒内热重载）";
+                UpdateSummary();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "保存失败：\r\n" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        void ShowJson()
+        {
+            try
+            {
+                List<string> w = new List<string>();
+                string json = Cfg.ToJson(frame, w);
+                Form f = new Form();
+                f.Text = "JSON 预览";
+                f.ClientSize = new Size(S(780), S(640));
+                f.StartPosition = FormStartPosition.CenterParent;
+                TextBox t = new TextBox();
+                t.Multiline = true; t.ReadOnly = true; t.ScrollBars = ScrollBars.Vertical; t.WordWrap = true;
+                t.Dock = DockStyle.Fill; t.Font = new Font("Consolas", 12f * k, GraphicsUnit.Pixel); t.Text = json;
+                f.Controls.Add(t);
+                f.ShowDialog(this);
+            }
+            catch (Exception ex) { MessageBox.Show(this, ex.Message, "错误"); }
+        }
+
+        void ShowHelp()
+        {
+            MessageBox.Show(this,
+                "VOFA+ 自定义协议配置工具\r\n\r\n" +
+                "1. 点上面的按钮添加段：帧头/帧序号/帧ID/帧长度/1~8Byte/定长数组/变长数组/校验/帧尾；\r\n" +
+                "2. 表格里灰色数字只读（长度由类型决定），黑色可改（帧头、帧尾，自动按 HEX 分段）；\r\n" +
+                "3. 右侧按段类型显示可设置项：数据段选整数/浮点与字节序、倍率、偏置；帧长度段设宽度与 adjust；校验段选类型与区间；\r\n" +
+                "4. 表格最右「−」删除该段；\r\n" +
+                "5. 保存后 VOFA+ 每秒检查一次配置，约 1 秒内热重载。\r\n\r\n" +
+                "插件能力边界：校验只有 NONE/SUM8/XOR8/CRC16-MODBUS；不支持数组、3 字节字段与变长解析，\r\n" +
+                "这些段在工具里只能作为占位（保证后续字段偏移正确），不会输出为通道。",
+                "用法说明", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
+    // ================= 入口 =================
+    static class Program
+    {
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)] static extern bool SetProcessDpiAwarenessContext(IntPtr value); static bool dpiOk = false; static int dpiErr = -1; [STAThread]
+        static void Main(string[] args)
+        {
+            try { dpiOk = SetProcessDpiAwarenessContext(new IntPtr(-4)); if (!dpiOk) { dpiErr = System.Runtime.InteropServices.Marshal.GetLastWin32Error(); dpiOk = SetProcessDpiAwarenessContext(new IntPtr(-2)); if (!dpiOk) dpiErr = System.Runtime.InteropServices.Marshal.GetLastWin32Error(); } } catch { } if (args.Length >= 1 && args[0] == "--selftest") { SelfTest(args.Length >= 2 ? args[1] : null); return; }
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException); Application.ThreadException += delegate(object s3, System.Threading.ThreadExceptionEventArgs te) { Program.LogError(te.Exception); }; Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            MainForm f = new MainForm();
+            if (args.Length >= 1 && File.Exists(args[0])) f.OpenPath(args[0]);
+            Application.Run(f);
+        }
+
+        internal static void LogError(Exception ex){ try { string f = Path.Combine(Application.StartupPath, "error.log"); File.AppendAllText(f, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + (ex == null ? "null" : ex.ToString()) + "\r\n\r\n", new UTF8Encoding(false)); } catch { } }
+        static void SelfTest(string target)
+        {
+            StringBuilder log = new StringBuilder();
+            log.AppendLine("VOFA+ 协议配置工具 v4 selftest   " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            log.AppendLine("exe        = " + Application.ExecutablePath);
+            log.AppendLine("进程名     = " + Path.GetFileName(Application.ExecutablePath)); Form probe = new Form(); probe.CreateControl(); log.AppendLine("DPI 声明   = " + dpiOk + "  err=" + dpiErr); log.AppendLine("DPI 探测   = DeviceDpi " + probe.DeviceDpi + "  (96=100%或未感知, 120=125%, 144=150%)"); probe.Dispose();
+            try
+            {
+                Frame d = Cfg.Default();
+                List<string> w = new List<string>();
+                string json = Cfg.ToJson(d, w);
+                log.AppendLine("默认布局   总长 " + d.TotalBytes() + " 字节");
+                log.AppendLine("导出 JSON  " + json.Length + " 字符"); log.AppendLine("预览片段:" + json.Substring(0, Math.Min(380, json.Length)));
+                Frame back = Cfg.FromJson(json);
+                log.AppendLine("回读布局   总长 " + back.TotalBytes() + " 字节，段数 " + back.Segs.Count);
+                bool okLayout = back.TotalBytes() == d.TotalBytes() && back.Segs.Count == d.Segs.Count;
+                List<string> e = Cfg.Validate(back);
+                log.AppendLine("回读校验   " + (e.Count == 0 ? "通过" : "失败 -> " + string.Join(" | ", e.ToArray())));
+                log.AppendLine("往返自测   " + (okLayout && e.Count == 0 ? "OK" : "FAIL"));
+                string j2 = Cfg.ToJson(back, new List<string>());
+                log.AppendLine("二次导出稳定 " + (j2 == json ? "OK" : "FAIL"));
+                if (target != null && File.Exists(target))
+                {
+                    byte[] raw = File.ReadAllBytes(target);
+                    string head = Encoding.ASCII.GetString(raw, 0, Math.Min(raw.Length, 16));
+                    log.AppendLine("目标文件   = " + target);
+                    log.AppendLine("文件头     = " + head.Replace("\0", "."));
+                    if (head.IndexOf('{') < 0) log.AppendLine("读取结果   = 非 JSON 内容（文件可能损坏或不是配置文件）");
+                    else
+                    {
+                        log.AppendLine("读取结果   = 非 JSON 内容（文件可能损坏或不是配置文件）");
+                        string text = Encoding.UTF8.GetString(raw);
+                        if (text.Length > 0 && text[0] == '\uFEFF') text = text.Substring(1);
+                        Frame cur = Cfg.FromJson(text);
+                        log.AppendLine("回读当前配置：总长 " + cur.TotalBytes() + " 字节，段数 " + cur.Segs.Count + "，name=" + cur.Name);
+                        for (int i = 0; i < cur.Segs.Count; i++)
+                        {
+                            Segment s = cur.Segs[i];
+                            log.AppendLine("   @" + cur.OffsetOf(i) + " " + cur.KindName(s) + " (" + s.Kind + ") " + s.Bytes + " 字节"
+                                + (s.Kind == "data" ? "  类型=" + s.PType + " 端序=" + s.Endian + " scale=" + s.Scale + " bias=" + s.Bias : "")
+                                + (s.Kind == "sum" ? "  校验=" + s.ChkType + " 区间=[" + s.RangeFrom + "," + (s.RangeTo < 0 ? cur.OffsetOf(i) : s.RangeTo) + ")" : "")
+                                + (s.Kind == "len" ? "  size=" + s.LenSize + " adjust=" + s.LenAdjust : ""));
+                        }
+                        List<string> e2 = Cfg.Validate(cur);
+                        log.AppendLine("当前配置校验 " + (e2.Count == 0 ? "通过" : "失败 -> " + string.Join(" | ", e2.ToArray())));
+                    }
+                }
+                log.AppendLine("RESULT=OK");
+            }
+            catch (Exception ex)
+            {
+                log.AppendLine("RESULT=FAIL " + ex.ToString());
+            }
+            string outFile = Path.Combine(Application.StartupPath, "selftest.log");
+            try { File.WriteAllText(outFile, log.ToString(), new UTF8Encoding(false)); } catch { }
+            Console.WriteLine(log.ToString());
+        }
+    }
+}
